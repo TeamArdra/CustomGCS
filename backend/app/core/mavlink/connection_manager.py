@@ -31,10 +31,14 @@ class ConnectionManager:
         connection_string: str,
         source_system: int = 255,
         source_component: int = 0,
+        baudrate: Optional[int] = None,
+        connect_timeout_s: float = 5.0,
     ) -> None:
         self._connection_string = connection_string
         self._source_system = source_system
         self._source_component = source_component
+        self._baudrate = baudrate
+        self._connect_timeout_s = connect_timeout_s
 
         # Internal connection handle (pymavlink)
         self._mavlink: Optional[mavutil.mavlink_connection] = None
@@ -56,14 +60,25 @@ class ConnectionManager:
             raise RuntimeError("Connection already established")
         
         #Create MAVLink connection
-        mav = mavutil.mavlink_connection(
-            self._connection_string,
-            source_system=self._source_system,
-            source_component=self._source_component,
-        )
+        connection_kwargs = {
+            "source_system": self._source_system,
+            "source_component": self._source_component,
+        }
+        if self._baudrate is not None:
+            connection_kwargs["baud"] = self._baudrate
+
+        mav = mavutil.mavlink_connection(self._connection_string, **connection_kwargs)
 
         #Wait for first heartbeat (blocking, mocked in tests)
-        mav.wait_heartbeat()
+        first_heartbeat = mav.wait_heartbeat(timeout=self._connect_timeout_s)
+        if first_heartbeat is None:
+            try:
+                mav.close()
+            except Exception:
+                pass
+            raise TimeoutError(
+                f"No heartbeat received within {self._connect_timeout_s:.1f}s"
+            )
 
         #Lock target IDs
         self._mavlink = mav

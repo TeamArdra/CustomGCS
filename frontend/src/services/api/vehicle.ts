@@ -1,5 +1,11 @@
 import apiClient from './client';
 
+export interface MotorTestPayload {
+  motor_number: number;
+  throttle_percent: number;
+  duration_sec: number;
+}
+
 export const vehicleService = {
   getVehicleInfo: async () => {
     const response = await apiClient.get('/vehicle/info');
@@ -20,6 +26,10 @@ export const vehicleService = {
 
   sendCommand: async (command: string, params: Record<string, unknown>): Promise<void> => {
     await apiClient.post('/vehicle/command', { command, params });
+  },
+
+  motorTest: async (payload: MotorTestPayload): Promise<void> => {
+    await apiClient.post('/vehicle/motor-test', payload);
   },
 
   rtl: async (): Promise<void> => {

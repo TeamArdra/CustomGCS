@@ -26,6 +26,12 @@ apiClient.interceptors.response.use(
       localStorage.removeItem('authToken');
       window.location.href = '/login';
     }
+
+    const backendDetail = error?.response?.data?.detail;
+    if (typeof backendDetail === 'string' && backendDetail.trim().length > 0) {
+      return Promise.reject(new Error(backendDetail));
+    }
+
     return Promise.reject(error);
   }
 );

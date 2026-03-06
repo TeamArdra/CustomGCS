@@ -1,25 +1,28 @@
 import { Activity, Gauge, Wind, Zap, Satellite, Compass as CompassIcon, Thermometer, BarChart3, WifiOff } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useTelemetryStore } from '../store/telemetryStore';
 import { useConnectionStore } from '../store/connectionStore';
 import { startMockTelemetryStream } from '../utils/mockTelemetry';
 import ArtificialHorizon from '../components/widgets/ArtificialHorizon';
 
 export default function DashboardPage() {
-  const [mockStreamStop, setMockStreamStop] = useState<(() => void) | null>(null);
+  const [nowMs, setNowMs] = useState(Date.now());
   const telemetry = useTelemetryStore((state) => state.currentTelemetry);
   const updateTelemetry = useTelemetryStore((state) => state.updateTelemetry);
   const setIsReceiving = useTelemetryStore((state) => state.setIsReceiving);
-  const { mockMode, setConnected } = useConnectionStore();
+  const { mockMode, setConnected, isConnected } = useConnectionStore();
 
-  // Only show telemetry data in mock mode (or when connected in live mode)
-  const displayTelemetry = mockMode ? telemetry : null;
+  // Show telemetry only when connected (mock or live)
+  const displayTelemetry = isConnected ? telemetry : null;
+  const telemetryDelayMs = useMemo(() => {
+    if (!displayTelemetry?.timestamp) {
+      return null;
+    }
+    return Math.max(0, nowMs - displayTelemetry.timestamp);
+  }, [displayTelemetry?.timestamp, nowMs]);
 
   useEffect(() => {
-    // Only start mock telemetry if in mock mode
     if (!mockMode) {
-      // In LIVE mode without backend - disconnect
-      setConnected(false);
       setIsReceiving(false);
       return;
     }
@@ -31,14 +34,26 @@ export default function DashboardPage() {
       setConnected(true); // Connected when receiving data
     }, 500);
 
-    setMockStreamStop(() => stop);
-
     return () => {
       stop();
       setIsReceiving(false);
-      setConnected(false); // Disconnected when unmounting
+      setConnected(false);
     };
   }, [mockMode, updateTelemetry, setIsReceiving, setConnected]);
+
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 200);
+    return () => clearInterval(timer);
+  }, []);
+
+  const telemetryDelayTone =
+    telemetryDelayMs == null
+      ? 'text-slate-300'
+      : telemetryDelayMs < 120
+      ? 'text-emerald-300'
+      : telemetryDelayMs < 300
+      ? 'text-amber-300'
+      : 'text-rose-300';
   return (
     <div className="h-full w-full bg-gradient-to-br from-slate-900/20 to-slate-950/20 p-6 space-y-8">
       {/* Header Section */}
@@ -59,7 +74,7 @@ export default function DashboardPage() {
                 <p className="pt-2 text-4xl font-bold text-blue-100">
                   {displayTelemetry?.altitude ?? '--'} m
                 </p>
-                <p className="text-xs text-slate-500 mt-1">Above sea level</p>
+                <p className="text-xs text-slate-500 mt-1">Relative to home</p>
               </div>
               <div className="rounded-xl bg-blue-500/20 p-3 ring-1 ring-blue-500/40 group-hover:bg-blue-500/30 transition-all">
                 <Gauge className="h-7 w-7 text-blue-300" strokeWidth={1.5} />
@@ -211,6 +226,35 @@ export default function DashboardPage() {
                 <span className="text-xs text-slate-500 mb-1">GPS Status</span>
                 <span className="text-lg font-bold text-rose-200">
                   {displayTelemetry?.satCount ?? '--'} sats
+                </span>
+              </div>
+
+              <div className="flex flex-col p-3 rounded-lg bg-slate-900/40 border border-slate-800/50">
+                <span className="text-xs text-slate-500 mb-1">Mode</span>
+                <span className="text-lg font-bold text-cyan-200">
+                  {displayTelemetry?.mode ?? '--'}
+                </span>
+              </div>
+
+              <div className="flex flex-col p-3 rounded-lg bg-slate-900/40 border border-slate-800/50">
+                <span className="text-xs text-slate-500 mb-1">Arm State</span>
+                <span
+                  className={`text-lg font-bold ${
+                    displayTelemetry?.armed
+                      ? 'text-rose-300'
+                      : displayTelemetry
+                      ? 'text-emerald-300'
+                      : 'text-slate-300'
+                  }`}
+                >
+                  {displayTelemetry?.armed ? 'ARMED' : displayTelemetry ? 'DISARMED' : '--'}
+                </span>
+              </div>
+
+              <div className="flex flex-col p-3 rounded-lg bg-slate-900/40 border border-slate-800/50">
+                <span className="text-xs text-slate-500 mb-1">Telemetry Delay</span>
+                <span className={`text-lg font-bold ${telemetryDelayTone}`}>
+                  {telemetryDelayMs != null ? `${telemetryDelayMs} ms` : '--'}
                 </span>
               </div>
             </div>

@@ -2,7 +2,7 @@ import { create } from 'zustand';
 
 export interface CalibrationState {
   isCalibrating: boolean;
-  calibrationType: 'compass' | 'accelerometer' | 'gyroscope' | null;
+  calibrationType: 'compass' | 'accelerometer' | 'gyroscope' | 'radio' | 'esc' | null;
   progress: number;
   message: string;
   results: CalibrationResult[];

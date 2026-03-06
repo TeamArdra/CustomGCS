@@ -7,11 +7,23 @@ class WebSocketClient {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private reconnectDelay = 3000;
+  private shouldReconnect = true;
   private messageHandlers: Map<string, (data: unknown) => void> = new Map();
 
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          resolve();
+          return;
+        }
+
+        if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
+          resolve();
+          return;
+        }
+
+        this.shouldReconnect = true;
         this.ws = new WebSocket(`${WS_BASE_URL}/telemetry`);
 
         this.ws.onopen = () => {
@@ -36,7 +48,11 @@ class WebSocketClient {
 
         this.ws.onclose = () => {
           console.log('WebSocket disconnected');
-          this.attemptReconnect();
+          const telemetryStore = useTelemetryStore.getState();
+          telemetryStore.setIsReceiving(false);
+          if (this.shouldReconnect) {
+            this.attemptReconnect();
+          }
         };
       } catch (error) {
         reject(error);
@@ -45,6 +61,7 @@ class WebSocketClient {
   }
 
   disconnect(): void {
+    this.shouldReconnect = false;
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -73,6 +90,7 @@ class WebSocketClient {
       const telemetryStore = useTelemetryStore.getState();
       const telemetryData = data as any; // Cast temporarily - will be properly typed from backend
       telemetryStore.updateTelemetry(telemetryData);
+      telemetryStore.setIsReceiving(true);
     }
 
     // Handle custom message types
