@@ -1,4 +1,4 @@
-import { Compass, Gauge, Radio, Zap } from 'lucide-react';
+import { Activity, Compass, Gauge, Radio, Satellite, Zap } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { calibrationService, type CalibrationItem, type CalibrationType } from '../services/api/calibration';
 import { useConnectionStore } from '../store';
@@ -10,6 +10,9 @@ const SENSOR_META: Record<string, { name: string; icon: typeof Compass }> = {
   gyroscope: { name: 'Gyroscope', icon: Gauge },
   radio: { name: 'Radio', icon: Radio },
   esc: { name: 'ESC', icon: Zap },
+  accel: { name: "Accelerometer", icon: Gauge },
+  gps: { name: "GPS", icon: Satellite },
+  pid: { name: "PID Controller", icon: Activity }
 };
 
 function formatLastCalibrated(timestamp?: number | null): string {
@@ -103,6 +106,35 @@ export default function CalibrationPage() {
     const order = ['compass', 'accelerometer', 'gyroscope', 'radio', 'esc'];
     return [...items].sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type));
   }, [items]);
+
+
+  const runPIDCalibration = () => {
+  console.log("Running PID Calibration...");
+  alert("PID Calibration Started");
+};
+
+const runGPSCalibration = () => {
+  console.log("Running GPS Calibration...");
+  alert("GPS Calibration Started");
+};
+
+const runAccelCalibration = () => {
+  console.log("Running Accelerometer Calibration...");
+  alert("Accelerometer Calibration Started");
+};
+
+const runESCCalibration = () => {
+  console.log("Running ESC Calibration...");
+  alert("ESC Calibration Started");
+};
+
+const runCompassCalibration = () => {
+  console.log("Running Compass Calibration...");
+  alert("Compass Calibration Started");
+};
+
+
+
 
   return (
     <div className="h-full w-full bg-gradient-to-br from-slate-900/20 to-slate-950/20 p-6 space-y-6">
@@ -201,5 +233,8 @@ export default function CalibrationPage() {
         </div>
       )}
     </div>
+    
+
+
   );
 }
