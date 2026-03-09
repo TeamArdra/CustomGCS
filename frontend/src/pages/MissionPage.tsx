@@ -1,5 +1,7 @@
-import { useState } from 'react';
+import { useRef, useState, type ChangeEvent } from 'react';
 import { MapPin, Plus, Trash2, Download, Upload, Play, Edit2, Eye, EyeOff } from 'lucide-react';
+import { missionService, type MissionUploadItem } from '../services/api/mission';
+import { useConnectionStore } from '../store/connectionStore';
 
 interface Waypoint {
   id: number;
@@ -12,7 +14,29 @@ interface Waypoint {
   delay: number;
 }
 
+function commandToType(command: number): Waypoint['type'] {
+  if (command === 22) return 'Takeoff';
+  if (command === 21) return 'Land';
+  if (command === 19) return 'Loiter';
+  if (command === 20) return 'RTL';
+  return 'Waypoint';
+}
+
+function missionItemsToWaypoints(items: MissionUploadItem[]): Waypoint[] {
+  return items.map((item, index) => ({
+    id: index + 1,
+    type: commandToType(Number(item.command)),
+    lat: Number(item.x),
+    lon: Number(item.y),
+    alt: Number(item.z),
+    speed: 15,
+    heading: Number(item.param4 ?? 0),
+    delay: Number(item.param1 ?? 0),
+  }));
+}
+
 export default function MissionPage() {
+  const { isConnected, mockMode } = useConnectionStore();
   const [waypoints, setWaypoints] = useState<Waypoint[]>([
     { id: 1, type: 'Takeoff', lat: 37.7749, lon: -122.4194, alt: 10, speed: 5, heading: 0, delay: 0 },
     { id: 2, type: 'Waypoint', lat: 37.7750, lon: -122.4180, alt: 50, speed: 15, heading: 90, delay: 0 },
@@ -23,6 +47,165 @@ export default function MissionPage() {
   const [selectedWaypoint, setSelectedWaypoint] = useState<number | null>(null);
   const [showMap, setShowMap] = useState(true);
   const [editMode, setEditMode] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const extractMissionItems = (payload: unknown): MissionUploadItem[] => {
+    const candidate = payload as Record<string, unknown>;
+
+    let rawItems: unknown[] | null = null;
+    if (Array.isArray(payload)) {
+      rawItems = payload;
+    } else if (Array.isArray(candidate?.items)) {
+      rawItems = candidate.items as unknown[];
+    } else if (Array.isArray((candidate?.mission as Record<string, unknown> | undefined)?.items)) {
+      rawItems = (candidate.mission as Record<string, unknown>).items as unknown[];
+    } else if (Array.isArray(candidate?.mission)) {
+      rawItems = candidate.mission as unknown[];
+    } else if (Array.isArray(candidate?.waypoints)) {
+      const waypoints = candidate.waypoints as Array<Record<string, unknown>>;
+      rawItems = waypoints.map((wp, index) => {
+        const isFirst = index === 0;
+        const isLast = index === waypoints.length - 1;
+        return {
+          frame: 10,
+          command: isFirst ? 22 : isLast ? 21 : 19,
+          param1: Number(wp.holdTime ?? wp.delay ?? 0),
+          param2: 0,
+          param3: 0,
+          param4: Number(wp.heading ?? 0),
+          x: Number(wp.latitude ?? wp.lat ?? 0),
+          y: Number(wp.longitude ?? wp.lon ?? 0),
+          z: Number(wp.altitude ?? wp.alt ?? 0),
+        };
+      });
+    }
+
+    if (!rawItems || rawItems.length === 0) {
+      throw new Error('Unsupported JSON format. Expected an array of mission items or { items: [...] }.');
+    }
+
+    const items = rawItems.map((item, index) => {
+      const row = item as Record<string, unknown>;
+
+      const params = Array.isArray(row.params) ? (row.params as unknown[]) : [];
+
+      const xCandidate = row.x ?? row.lat ?? row.latitude ?? params[4];
+      const yCandidate = row.y ?? row.lon ?? row.lng ?? row.longitude ?? params[5];
+      const zCandidate = row.z ?? row.alt ?? row.altitude ?? params[6];
+
+      const frame = Number(row.frame ?? 10);
+      const command = Number(row.command);
+      const x = Number(xCandidate);
+      const y = Number(yCandidate);
+      const z = Number(zCandidate);
+
+      if (!Number.isFinite(frame) || !Number.isFinite(command) || !Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+        throw new Error(`Mission item at index ${index} has invalid frame/command/coordinates.`);
+      }
+
+      return {
+        frame,
+        command,
+        param1: Number(row.param1 ?? params[0] ?? 0),
+        param2: Number(row.param2 ?? params[1] ?? 0),
+        param3: Number(row.param3 ?? params[2] ?? 0),
+        param4: Number(row.param4 ?? params[3] ?? 0),
+        x,
+        y,
+        z,
+      };
+    });
+
+    return items;
+  };
+
+  const onUploadClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const onMissionFileSelected = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    setIsUploading(true);
+    setUploadStatus(null);
+
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as unknown;
+      const items = extractMissionItems(parsed);
+      const result = await missionService.uploadMissionItems(items);
+      setWaypoints(missionItemsToWaypoints(items));
+
+      if (result.queued) {
+        setUploadStatus(`Saved ${items.length} mission items from ${file.name} (vehicle disconnected, queued).`);
+      } else {
+        setUploadStatus(`Uploaded ${items.length} mission items from ${file.name} to vehicle.`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to upload mission file';
+      setUploadStatus(message);
+    } finally {
+      setIsUploading(false);
+      event.target.value = '';
+    }
+  };
+
+  const onDownloadMission = async () => {
+    setUploadStatus(null);
+    try {
+      const missions = await missionService.getMissions();
+      const firstMission = missions[0];
+      if (!firstMission || !Array.isArray(firstMission.waypoints) || firstMission.waypoints.length === 0) {
+        setUploadStatus('No mission items available on backend/vehicle.');
+        return;
+      }
+
+      const nextWaypoints: Waypoint[] = firstMission.waypoints.map((wp, index) => ({
+        id: index + 1,
+        type: commandToType(Number(wp.command)),
+        lat: Number(wp.latitude),
+        lon: Number(wp.longitude),
+        alt: Number(wp.altitude),
+        speed: 15,
+        heading: Number(wp.params?.param4 ?? 0),
+        delay: Number(wp.holdTime ?? 0),
+      }));
+
+      setWaypoints(nextWaypoints);
+      setUploadStatus(`Loaded ${nextWaypoints.length} waypoints from backend.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to download mission from backend';
+      setUploadStatus(message);
+    }
+  };
+
+  const onStartMission = async () => {
+    setUploadStatus(null);
+    try {
+      await missionService.executeMission('active-mission');
+      setUploadStatus('Mission start command sent.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to start mission';
+      setUploadStatus(message);
+    }
+  };
+
+  const onClearMission = async () => {
+    setUploadStatus(null);
+    try {
+      await missionService.abortMission();
+      setWaypoints([]);
+      setUploadStatus('Mission cleared from backend queue.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to clear mission';
+      setUploadStatus(message);
+    }
+  };
 
   const addWaypoint = () => {
     const newId = Math.max(...waypoints.map(w => w.id), 0) + 1;
@@ -125,26 +308,47 @@ export default function MissionPage() {
                 <Plus className="h-4 w-4" />
                 Add Waypoint
               </button>
-              <button className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800/50 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors">
+              <button
+                onClick={onUploadClick}
+                disabled={isUploading}
+                className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800/50 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors disabled:opacity-50"
+              >
                 <Upload className="h-4 w-4" />
-                Upload
+                {isUploading ? 'Uploading...' : 'Upload JSON'}
               </button>
-              <button className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800/50 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors">
+              <button
+                onClick={() => void onDownloadMission()}
+                className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800/50 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors"
+              >
                 <Download className="h-4 w-4" />
                 Download
               </button>
-              <button className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-emerald-600/80 hover:bg-emerald-600 text-white text-sm font-medium transition-colors">
+              <button
+                onClick={() => void onStartMission()}
+                className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-emerald-600/80 hover:bg-emerald-600 text-white text-sm font-medium transition-colors"
+              >
                 <Play className="h-4 w-4" />
                 Start Mission
               </button>
               <button
-                onClick={() => setWaypoints([])}
+                onClick={() => void onClearMission()}
                 className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-rose-600/80 hover:bg-rose-600 text-white text-sm font-medium transition-colors"
               >
                 <Trash2 className="h-4 w-4" />
                 Clear All
               </button>
             </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={(event) => void onMissionFileSelected(event)}
+            />
+            {!mockMode && !isConnected && (
+              <p className="text-xs text-amber-300">Vehicle disconnected: uploads will be queued on backend until reconnect.</p>
+            )}
+            {uploadStatus && <p className="text-xs text-slate-400">{uploadStatus}</p>}
           </div>
 
           {/* Statistics */}

@@ -8,6 +8,8 @@ import type { ConnectionDevice } from '../../services/api/connection';
 const FLIGHT_MODES = ['STABILIZE', 'ACRO', 'GUIDED', 'AUTO', 'LOITER', 'LAND', 'RTL'];
 
 const FALLBACK_DEVICES: ConnectionDevice[] = [
+	{ id: 'tcp:127.0.0.1:5760', label: 'TCP (127.0.0.1:5760)', kind: 'network' as const },
+	{ id: 'udp:127.0.0.1:14555', label: 'UDP (127.0.0.1:14555)', kind: 'network' as const },
 	{ id: 'udp:127.0.0.1:14550', label: 'UDP (127.0.0.1:14550)', kind: 'network' as const },
 	{ id: 'tcp:192.168.1.100:5760', label: 'TCP (192.168.1.100:5760)', kind: 'network' as const },
 ];
@@ -18,7 +20,7 @@ export default function Header() {
 	const displayConnected = isConnected;
 
 	const [currentTime, setCurrentTime] = useState(new Date());
-	const [selectedDevice, setSelectedDevice] = useState('udp:127.0.0.1:14550');
+	const [selectedDevice, setSelectedDevice] = useState('tcp:127.0.0.1:5760');
 	const [availableDevices, setAvailableDevices] = useState<ConnectionDevice[]>(FALLBACK_DEVICES);
 	const [isScanning, setIsScanning] = useState(false);
 	const [isConnecting, setIsConnecting] = useState(false);
@@ -26,6 +28,7 @@ export default function Header() {
 	const [flightMode, setFlightMode] = useState('GUIDED');
 	const [isArmed, setIsArmed] = useState(false);
 	const [isSendingControl, setIsSendingControl] = useState(false);
+	const [quickAction, setQuickAction] = useState<string | null>(null);
 	const [lowLatency, setLowLatency] = useState(false);
 	const [isApplyingLatency, setIsApplyingLatency] = useState(false);
 
@@ -292,6 +295,28 @@ export default function Header() {
 		}
 	};
 
+	const handleQuickAction = async (action: 'rtl' | 'land' | 'loiter') => {
+		if (mockMode || !displayConnected || isSendingControl || quickAction) {
+			return;
+		}
+
+		setQuickAction(action.toUpperCase());
+		try {
+			if (action === 'rtl') {
+				await vehicleService.rtl();
+				setFlightMode('RTL');
+			} else if (action === 'land') {
+				await vehicleService.land();
+				setFlightMode('LAND');
+			} else {
+				await vehicleService.loiter();
+				setFlightMode('LOITER');
+			}
+		} finally {
+			setQuickAction(null);
+		}
+	};
+
 	return (
 		<header className="h-16 bg-[#2b2b2b] border-b border-[#1a1a1a] px-6 flex items-center justify-between">
 			{/* Left: Logo & Version */}
@@ -400,6 +425,28 @@ export default function Header() {
 						</option>
 					))}
 				</select>
+
+				<button
+					onClick={() => void handleQuickAction('rtl')}
+					disabled={Boolean(quickAction) || (!mockMode && !displayConnected)}
+					className="px-3 py-2 rounded bg-[#3a3a3a] border border-[#4a4a4a] text-white text-xs font-semibold transition-colors hover:bg-[#454545] disabled:opacity-40 disabled:cursor-not-allowed"
+				>
+					{quickAction === 'RTL' ? 'RTL...' : 'RTL'}
+				</button>
+				<button
+					onClick={() => void handleQuickAction('land')}
+					disabled={Boolean(quickAction) || (!mockMode && !displayConnected)}
+					className="px-3 py-2 rounded bg-[#3a3a3a] border border-[#4a4a4a] text-white text-xs font-semibold transition-colors hover:bg-[#454545] disabled:opacity-40 disabled:cursor-not-allowed"
+				>
+					{quickAction === 'LAND' ? 'LAND...' : 'LAND'}
+				</button>
+				<button
+					onClick={() => void handleQuickAction('loiter')}
+					disabled={Boolean(quickAction) || (!mockMode && !displayConnected)}
+					className="px-3 py-2 rounded bg-[#3a3a3a] border border-[#4a4a4a] text-white text-xs font-semibold transition-colors hover:bg-[#454545] disabled:opacity-40 disabled:cursor-not-allowed"
+				>
+					{quickAction === 'LOITER' ? 'LOITER...' : 'LOITER'}
+				</button>
 
 				{/* Arm/Disarm */}
 				<button

@@ -151,9 +151,26 @@ export default function DashboardPage() {
                   roll={displayTelemetry.roll}
                 />
               ) : (
-                <div className="text-center">
-                  <WifiOff className="h-10 w-10 text-slate-400 mx-auto mb-3" />
-                  <p className="text-slate-400">No Vehicle Connected</p>
+                <div className="mx-auto max-w-md rounded-2xl border border-slate-700/60 bg-slate-900/80 p-6 text-left shadow-xl shadow-black/30">
+                  <div className="mb-3 flex items-center gap-3">
+                    <div className="rounded-lg bg-amber-500/15 p-2 ring-1 ring-amber-500/30">
+                      <WifiOff className="h-5 w-5 text-amber-300" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-semibold text-slate-100">No Vehicle Telemetry</p>
+                      <p className="text-xs text-slate-400">Waiting for live telemetry stream</p>
+                    </div>
+                  </div>
+
+                  <p className="mb-3 text-xs text-slate-300">
+                    {mockMode
+                      ? 'You are in MOCK mode. Toggle LIVE mode from the header if you want to connect real hardware.'
+                      : 'Use the header controls to choose a device and click Connect.'}
+                  </p>
+
+                  <div className="rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-xs text-slate-400">
+                    Status: <span className={isConnected ? 'text-emerald-300' : 'text-amber-300'}>{isConnected ? 'Connected (waiting for stream)' : 'Disconnected'}</span>
+                  </div>
                 </div>
               )}
 

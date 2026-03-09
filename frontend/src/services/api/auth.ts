@@ -3,26 +3,22 @@ import type { User } from '../../types/vehicle';
 
 export const authService = {
   login: async (username: string, password: string) => {
-    const response = await apiClient.post('/auth/login', { username, password });
-    const { token, user } = response.data;
-    localStorage.setItem('authToken', token);
-    return { token, user };
+    void username;
+    void password;
+    throw new Error('Authentication endpoints are not available in this backend.');
   },
 
   logout: async () => {
-    await apiClient.post('/auth/logout');
     localStorage.removeItem('authToken');
   },
 
   getCurrentUser: async (): Promise<User> => {
-    const response = await apiClient.get('/auth/me');
-    return response.data;
+    throw new Error('Authentication endpoints are not available in this backend.');
   },
 
   refreshToken: async () => {
-    const response = await apiClient.post('/auth/refresh');
-    const { token } = response.data;
-    localStorage.setItem('authToken', token);
-    return token;
+    // Keep API shape for callers; there is no server-side auth refresh route.
+    const existing = localStorage.getItem('authToken') ?? '';
+    return existing;
   },
 };

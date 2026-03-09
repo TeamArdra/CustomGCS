@@ -1,258 +1,1149 @@
-#main.py
-from fastapi import FastAPI
+import asyncio
+import math
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from pprint import pformat
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from pymavlink import mavutil
+from serial.tools import list_ports
 
 from app.core.mavlink.connection_manager import ConnectionManager
-from app.core.mavlink.message_receiver import MessageReceiver
-from app.core.mavlink.message_dispatcher import MessageDispatcher
-from app.core.mavlink.heartbeat_sender import HeartbeatSender
-from app.core.mavlink.command_sender import CommandSender
-
-from app.core.state.telemetry_state import TelemetryState
-from app.api.state_router import get_state_router
-
-from app.core.stream.telemetry_streamer import TelemetryStreamer
-from app.core.state.parameter_cache import ParameterCache
-from app.api.telemetry_ws import get_telemetry_ws_router
-from app.api.command_router import get_command_router
-from app.core.mavlink.mission_manager import MissionManager
-from app.api.mission_router import get_mission_router
-
-from app.core.mavlink.parameter_manager import ParameterManager
-from app.api.parameter_router import get_parameter_router
-
-from app.core.state.parameter_metadata import ParameterMetadataRegistry
-from app.core.health.heartbeat_monitor import HeartbeatMonitor
-
-from app.core.health.vehicle_health_monitor import VehicleHealthMonitor
-from app.core.health.vehicle_status import VehicleStatusAggregator
-
-from app.core.events.event_manager import EventManager
-from app.core.events.alert_engine import AlertEngine
-
-from app.core.events.event_streamer import EventStreamer
-from app.api.events_ws import get_events_ws_router
-
-from app.core.logging.mavlink_logger import MAVLinkLogger
-
-from app.core.logging.log_manager import LogManager
-from app.api.log_router import get_log_router
-
-from app.core.mavlink.message_rate_controller import MessageRateController
-from app.api.message_rate_router import get_message_rate_router
-
-from app.core.state.health_state import HealthState
-from app.api.health_router import get_health_router
-
-from app.core.stream.health_streamer import HealthStreamer
-from app.api.health_ws import get_health_ws_router
-
-from app.core.mavlink.calibration_manager import CalibrationManager
-from app.api.calibration_router import get_calibration_router
-# ---------------------------------------------------
-# FastAPI Application
-# ---------------------------------------------------
-
-app = FastAPI(title="Custom Autonomous GCS Backend")
 
 
-# ---------------------------------------------------
-# Core System Components
-# ---------------------------------------------------
-
-# Dispatcher (routes MAVLink messages)
-dispatcher = MessageDispatcher()
-
-# MAVLink connection manager
-connection_manager = ConnectionManager(connection_string="udpin:0.0.0.0:14550")
-
-# Message receiver (reads MAVLink messages from connection)
-message_receiver = MessageReceiver(connection_manager,dispatcher)
-
-# Heartbeat sender (sends GCS heartbeat to vehicle)
-heartbeat_sender = HeartbeatSender(connection_manager)
-
-# Command system
-command_sender = CommandSender(connection_manager, dispatcher)
-
-# Telemetry state model
-telemetry_state = TelemetryState(dispatcher)
-
-telemetry_streamer = TelemetryStreamer(telemetry_state)
+class ConnectRequest(BaseModel):
+	connection_string: str
 
 
-mission_manager = MissionManager(connection_manager,dispatcher,command_sender)
+class SetModeRequest(BaseModel):
+	mode: str
 
-parameter_cache = ParameterCache()
-parameter_manager = ParameterManager(connection_manager,dispatcher,parameter_cache)
 
-parameter_metadata = ParameterMetadataRegistry()
+class CommandRequest(BaseModel):
+	command: str
+	params: dict = {}
 
-parameter_metadata.load_from_file("app/data/parameter_metadata.json")
 
-heartbeat_monitor = HeartbeatMonitor(message_receiver)
+class CalibrationStartRequest(BaseModel):
+	type: str
 
-vehicle_health_monitor = VehicleHealthMonitor(dispatcher)
 
-vehicle_status = VehicleStatusAggregator(
-     telemetry_state,
-     heartbeat_monitor,
-	 vehicle_health_monitor
+class MotorTestRequest(BaseModel):
+	motor_number: int = Field(ge=1, le=12)
+	throttle_percent: float = Field(gt=0, le=30)
+	duration_sec: float = Field(gt=0, le=5)
+
+
+class TelemetryProfileRequest(BaseModel):
+	low_latency: bool
+
+
+class MissionUploadRequest(BaseModel):
+	items: list[dict] = Field(default_factory=list)
+
+
+class PreflightCheckResponse(BaseModel):
+	id: str
+	name: str
+	status: str
+	message: str
+
+
+class ConnectionStatusResponse(BaseModel):
+	connected: bool
+	connection_string: Optional[str] = None
+	connected_at: Optional[float] = None
+
+
+class ConnectionDeviceResponse(BaseModel):
+	id: str
+	label: str
+	kind: str
+
+
+class CalibrationItemResponse(BaseModel):
+	type: str
+	status: str
+	last_calibrated: Optional[float] = None
+	message: str = ""
+
+
+@dataclass
+class ConnectionState:
+	connected: bool = False
+	connection_string: Optional[str] = None
+	connected_at: Optional[float] = None
+
+
+@dataclass
+class VehicleState:
+	armed: bool = False
+	mode: str = "UNKNOWN"
+
+
+@dataclass
+class RuntimeState:
+	connection_manager: Optional[ConnectionManager] = None
+	low_latency: bool = False
+	calibration_items: dict[str, CalibrationItemResponse] = None
+	recv_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+	latest_telemetry: dict = None
+	queued_mission_items: list[dict] = None
+
+
+app = FastAPI(title="CustomGCS Backend", version="0.2.0")
+
+app.add_middleware(
+	CORSMiddleware,
+	allow_origins=["*"],
+	allow_credentials=True,
+	allow_methods=["*"],
+	allow_headers=["*"],
 )
 
-event_manager = EventManager()
+connection_state = ConnectionState()
+vehicle_state = VehicleState()
+runtime_state = RuntimeState()
+runtime_state.latest_telemetry = {}
+runtime_state.queued_mission_items = []
+runtime_state.calibration_items = {
+	"compass": CalibrationItemResponse(
+		type="compass",
+		status="needs_calibration",
+		message="Compass calibration pending",
+	),
+	"accelerometer": CalibrationItemResponse(
+		type="accelerometer",
+		status="needs_calibration",
+		message="Accelerometer calibration pending",
+	),
+	"gyroscope": CalibrationItemResponse(
+		type="gyroscope",
+		status="needs_calibration",
+		message="Gyroscope calibration pending",
+	),
+	"radio": CalibrationItemResponse(
+		type="radio",
+		status="unknown",
+		message="Radio calibration status unknown",
+	),
+	"esc": CalibrationItemResponse(
+		type="esc",
+		status="unknown",
+		message="ESC calibration manual on most vehicles",
+	),
+}
 
-alert_engine = AlertEngine(
-     vehicle_status,
-	 event_manager
-)
+TELEMETRY_PUSH_INTERVAL_S = 0.05
+MAX_MESSAGES_PER_TICK = 200
+BLOCKING_POLL_TIMEOUT_S = 0.02
+DEFAULT_SERIAL_BAUD = 115200
 
-event_streamer = EventStreamer(event_manager)
+DEFAULT_MESSAGE_INTERVAL_US = {
+	mavutil.mavlink.MAVLINK_MSG_ID_HEARTBEAT: 500000,
+	mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE: 100000,
+	mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD: 100000,
+	mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT: 100000,
+	mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT: 200000,
+	mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS: 250000,
+}
 
-mavlink_logger = MAVLinkLogger(dispatcher)
-
-log_manager = LogManager(mavlink_logger)
-
-message_rate_controller = MessageRateController(
-	connection_manager,
-    command_sender
-)
-
-health_state = HealthState(dispatcher)
-health_streamer = HealthStreamer(health_state)
-
-calibration_manager = CalibrationManager(connection_manager, command_sender)
-# ---------------------------------------------------
-# API Routers
-# ---------------------------------------------------
-
-app.include_router(
-    get_state_router(telemetry_state),
-    prefix="/api"
-)
-
-app.include_router(
-    get_telemetry_ws_router(telemetry_streamer),
-    prefix="/ws"
-)
-
-app.include_router(
-    get_command_router(command_sender),
-    prefix="/api"
-)
-
-app.include_router(
-    get_mission_router(mission_manager),
-    prefix="/api"
-    
-)
-
-app.include_router(
-    get_parameter_router(parameter_manager,parameter_metadata),
-    prefix="/api"
-)
-
-app.include_router(
-      get_events_ws_router(event_streamer),
-      prefix="/ws"
-)
-
-app.include_router(
-	get_log_router(log_manager),
-    prefix="/api"
-)
-
-app.include_router(
-      get_message_rate_router(message_rate_controller),
-      prefix="/api"
-)
-
-app.include_router(
-      get_health_router(health_state),
-	  prefix="/api"
-)
-
-app.include_router(
-      get_health_ws_router(health_streamer),
-      prefix="/ws"
-)
-
-app.include_router(
-	get_calibration_router(calibration_manager),
-      prefix = "/api"
-)
-# ---------------------------------------------------
-# Application Startup / Shutdown
-# ---------------------------------------------------
-
-@app.on_event("startup")
-async def startup_event():
-    """
-    Initialize backend systems when FastAPI starts.
-    """
-
-    # Connect MAVLink
-    await connection_manager.connect()
-
-    # Start receiver loop
-    await message_receiver.start()
-
-    # Start heartbeat loop
-    await heartbeat_sender.start()
-    
-    await telemetry_streamer.start()
-    
-    await heartbeat_monitor.start()
-    
-    await alert_engine.start()
-    
-    await health_streamer.start()
-    
+LOW_LATENCY_MESSAGE_INTERVAL_US = {
+	mavutil.mavlink.MAVLINK_MSG_ID_HEARTBEAT: 250000,
+	mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE: 50000,
+	mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD: 50000,
+	mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT: 50000,
+	mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT: 100000,
+	mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS: 100000,
+}
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """
-    Cleanly stop backend systems.
-    """
-    await telemetry_streamer.stop()
-    await heartbeat_sender.stop()
-    await message_receiver.stop()
-
-    await connection_manager.disconnect()
-    
-    await heartbeat_monitor.stop()
-
-    await alert_engine.stop()
-    
-    mavlink_logger.stop()
-    
-    await health_streamer.stop()
-# ---------------------------------------------------
-# Root Endpoint (health check)
-# ---------------------------------------------------
-
-@app.get("/")
-def root():
-    return {"status": "GCS backend running"}
-
-@app.get("/api/vehicle/link")
-def vehicle_link_status():
-    
-	return{
-          "link_alive": heartbeat_monitor.link_alive
+def default_telemetry_payload() -> dict:
+	now = time.time()
+	return {
+		"roll": 0.0,
+		"pitch": 0.0,
+		"yaw": 0.0,
+		"altitude": 0.0,
+		"groundSpeed": 0.0,
+		"airSpeed": 0.0,
+		"climbRate": 0.0,
+		"heading": 0.0,
+		"latitude": 0.0,
+		"longitude": 0.0,
+		"batteries": [
+			{
+				"cellCount": 0,
+				"voltage": 0.0,
+				"current": 0.0,
+				"capacity": 0,
+				"remaining": 0.0,
+			}
+		],
+		"gpsStatus": "no_fix",
+		"satCount": 0,
+		"temperature": 0.0,
+		"mode": vehicle_state.mode,
+		"armed": vehicle_state.armed,
+		"timestamp": int(now * 1000),
 	}
 
-@app.get("/api/vehicle/health")
-def vehicle_health():
-     return vehicle_health.monitor.get_health()
 
-@app.get("/api/vehicle/status")
-def get_vehicle_status():
-     
-	 return vehicle_status.get_status()
+def parse_connection_string(connection_string: str) -> tuple[str, Optional[int]]:
+	if connection_string.startswith("serial:"):
+		parts = connection_string.split(":")
+		if len(parts) >= 2 and parts[1]:
+			baudrate = DEFAULT_SERIAL_BAUD
+			if len(parts) >= 3:
+				try:
+					baudrate = int(parts[2])
+				except ValueError:
+					baudrate = DEFAULT_SERIAL_BAUD
+			return parts[1], baudrate
+	return connection_string, None
 
-@app.get("/api/events")
-def get_events():
-      return{
-            "events": event_manager.get_events()
-	  }
+
+def ensure_connected_manager() -> ConnectionManager:
+	cm = runtime_state.connection_manager
+	if cm is None or not connection_state.connected:
+		raise HTTPException(status_code=409, detail="Vehicle not connected")
+	return cm
+
+
+def telemetry_push_interval() -> float:
+	return 0.03 if runtime_state.low_latency else TELEMETRY_PUSH_INTERVAL_S
+
+
+def apply_telemetry_profile(cm: ConnectionManager, low_latency: bool) -> None:
+	intervals = LOW_LATENCY_MESSAGE_INTERVAL_US if low_latency else DEFAULT_MESSAGE_INTERVAL_US
+
+	for message_id, interval_us in intervals.items():
+		try:
+			cm.mavlink.mav.command_long_send(
+				cm.target_system,
+				cm.target_component,
+				mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+				0,
+				float(message_id),
+				float(interval_us),
+				0,
+				0,
+				0,
+				0,
+				0,
+			)
+		except Exception:
+			continue
+
+
+def _default_mission_items() -> list[dict]:
+	return [
+		{
+			"frame": 10,
+			"command": 22,
+			"param1": 0,
+			"param2": 0,
+			"param3": 0,
+			"param4": 0,
+			"x": 0,
+			"y": 0,
+			"z": 3,
+		},
+		{
+			"frame": 10,
+			"command": 19,
+			"param1": 5,
+			"param2": 2,
+			"param3": 1,
+			"param4": 0,
+			"x": 0,
+			"y": 0,
+			"z": 0,
+		},
+		{
+			"frame": 10,
+			"command": 21,
+			"param1": 0,
+			"param2": 1,
+			"param3": 0,
+			"param4": 0,
+			"x": 0,
+			"y": 0,
+			"z": 0,
+		},
+	]
+
+
+def _validate_mission_items(items: list[dict]) -> list[dict]:
+	if not items:
+		raise HTTPException(status_code=422, detail="Mission items cannot be empty")
+
+	required_fields = {"frame", "command", "x", "y", "z"}
+	normalized: list[dict] = []
+
+	for index, item in enumerate(items):
+		if not isinstance(item, dict):
+			raise HTTPException(status_code=422, detail=f"Mission item at index {index} must be an object")
+
+		if not required_fields.issubset(item.keys()):
+			missing = sorted(list(required_fields - set(item.keys())))
+			raise HTTPException(
+				status_code=422,
+				detail=f"Mission item at index {index} is missing required fields: {', '.join(missing)}",
+			)
+
+		try:
+			normalized.append(
+				{
+					"frame": int(item["frame"]),
+					"command": int(item["command"]),
+					"param1": float(item.get("param1", 0)),
+					"param2": float(item.get("param2", 0)),
+					"param3": float(item.get("param3", 0)),
+					"param4": float(item.get("param4", 0)),
+					"x": float(item["x"]),
+					"y": float(item["y"]),
+					"z": float(item["z"]),
+				}
+			)
+		except (TypeError, ValueError) as error:
+			raise HTTPException(
+				status_code=422,
+				detail=f"Mission item at index {index} has invalid numeric values",
+			) from error
+
+	return normalized
+
+
+def _persist_code_mission_template(items: list[dict]) -> None:
+	target = Path(__file__).parent / "api" / "mission_template_store.py"
+	content = "CODE_MISSION_TEMPLATE = " + pformat(items, width=100, sort_dicts=False) + "\n"
+	target.write_text(content, encoding="utf-8")
+
+
+def build_preflight_checks() -> tuple[list[PreflightCheckResponse], bool]:
+	telemetry = runtime_state.latest_telemetry or default_telemetry_payload()
+	checks: list[PreflightCheckResponse] = []
+
+	if connection_state.connected:
+		checks.append(
+			PreflightCheckResponse(
+				id="connection",
+				name="Vehicle Link",
+				status="passed",
+				message="Vehicle connection is active",
+			)
+		)
+	else:
+		checks.append(
+			PreflightCheckResponse(
+				id="connection",
+				name="Vehicle Link",
+				status="failed",
+				message="No active vehicle link",
+			)
+		)
+
+	gps_status = telemetry.get("gpsStatus", "no_fix")
+	sat_count = int(telemetry.get("satCount", 0) or 0)
+	if gps_status == "3d" and sat_count >= 8:
+		checks.append(
+			PreflightCheckResponse(
+				id="gps",
+				name="GPS Lock",
+				status="passed",
+				message=f"3D fix with {sat_count} satellites",
+			)
+		)
+	elif gps_status == "2d" or sat_count >= 6:
+		checks.append(
+			PreflightCheckResponse(
+				id="gps",
+				name="GPS Lock",
+				status="warning",
+				message=f"Limited fix ({gps_status}) with {sat_count} satellites",
+			)
+		)
+	else:
+		checks.append(
+			PreflightCheckResponse(
+				id="gps",
+				name="GPS Lock",
+				status="failed",
+				message=f"No reliable GPS fix ({sat_count} satellites)",
+			)
+		)
+
+	batteries = telemetry.get("batteries", [])
+	battery_remaining = 0.0
+	battery_voltage = 0.0
+	if batteries and isinstance(batteries, list):
+		battery_remaining = float(batteries[0].get("remaining", 0.0) or 0.0)
+		battery_voltage = float(batteries[0].get("voltage", 0.0) or 0.0)
+
+	if battery_remaining >= 30:
+		checks.append(
+			PreflightCheckResponse(
+				id="battery",
+				name="Battery",
+				status="passed",
+				message=f"{battery_remaining:.1f}% ({battery_voltage:.2f}V)",
+			)
+		)
+	elif battery_remaining >= 20:
+		checks.append(
+			PreflightCheckResponse(
+				id="battery",
+				name="Battery",
+				status="warning",
+				message=f"Low battery {battery_remaining:.1f}% ({battery_voltage:.2f}V)",
+			)
+		)
+	else:
+		checks.append(
+			PreflightCheckResponse(
+				id="battery",
+				name="Battery",
+				status="failed",
+				message=f"Critical battery {battery_remaining:.1f}% ({battery_voltage:.2f}V)",
+			)
+		)
+
+	timestamp = int(telemetry.get("timestamp", 0) or 0)
+	age_ms = int(time.time() * 1000) - timestamp if timestamp else 999999
+	if age_ms < 1000:
+		checks.append(
+			PreflightCheckResponse(
+				id="telemetry",
+				name="Telemetry Freshness",
+				status="passed",
+				message=f"Fresh data ({age_ms} ms old)",
+			)
+		)
+	elif age_ms < 2500:
+		checks.append(
+			PreflightCheckResponse(
+				id="telemetry",
+				name="Telemetry Freshness",
+				status="warning",
+				message=f"Slight delay ({age_ms} ms old)",
+			)
+		)
+	else:
+		checks.append(
+			PreflightCheckResponse(
+				id="telemetry",
+				name="Telemetry Freshness",
+				status="failed",
+				message=f"Stale data ({age_ms} ms old)",
+			)
+		)
+
+	climb_rate = float(telemetry.get("climbRate", 0.0) or 0.0)
+	if abs(climb_rate) < 1.0:
+		checks.append(
+			PreflightCheckResponse(
+				id="vertical_stability",
+				name="Vertical Stability",
+				status="passed",
+				message=f"Climb rate stable ({climb_rate:.2f} m/s)",
+			)
+		)
+	else:
+		checks.append(
+			PreflightCheckResponse(
+				id="vertical_stability",
+				name="Vertical Stability",
+				status="warning",
+				message=f"Vertical movement detected ({climb_rate:.2f} m/s)",
+			)
+		)
+
+	if vehicle_state.armed:
+		checks.append(
+			PreflightCheckResponse(
+				id="arm_state",
+				name="Arm State",
+				status="warning",
+				message="Vehicle is ARMED",
+			)
+		)
+	else:
+		checks.append(
+			PreflightCheckResponse(
+				id="arm_state",
+				name="Arm State",
+				status="passed",
+				message="Vehicle is disarmed",
+			)
+		)
+
+	has_failed = any(item.status == "failed" for item in checks)
+	ready_for_flight = (not has_failed) and connection_state.connected
+	return checks, ready_for_flight
+
+
+def update_filtered_altitude(snapshot: dict, new_altitude: float) -> None:
+	current_altitude = float(snapshot.get("altitude", 0.0) or 0.0)
+	ground_speed = float(snapshot.get("groundSpeed", 0.0) or 0.0)
+	climb_rate = float(snapshot.get("climbRate", 0.0) or 0.0)
+
+	is_stationary = ground_speed < 0.6 and abs(climb_rate) < 0.2
+	delta = new_altitude - current_altitude
+
+	# Ignore tiny altitude jitter while stationary
+	if is_stationary and abs(delta) < 0.35:
+		return
+
+	# Smooth altitude transitions to reduce sensor flicker
+	alpha = 0.2 if is_stationary else 0.35
+	filtered = current_altitude + (delta * alpha)
+	snapshot["altitude"] = round(filtered, 2)
+
+
+def apply_message_to_telemetry(snapshot: dict, msg) -> None:
+	msg_type = msg.get_type()
+
+	if msg_type == "ATTITUDE":
+		snapshot["roll"] = round(math.degrees(msg.roll), 2)
+		snapshot["pitch"] = round(math.degrees(msg.pitch), 2)
+		snapshot["yaw"] = round((math.degrees(msg.yaw) + 360) % 360, 2)
+
+	elif msg_type == "VFR_HUD":
+		snapshot["groundSpeed"] = round(float(msg.groundspeed), 2)
+		snapshot["airSpeed"] = round(float(msg.airspeed), 2)
+		snapshot["climbRate"] = round(float(msg.climb), 2)
+		snapshot["heading"] = round(float(msg.heading), 2)
+
+	elif msg_type == "GLOBAL_POSITION_INT":
+		snapshot["latitude"] = round(float(msg.lat) / 1e7, 7)
+		snapshot["longitude"] = round(float(msg.lon) / 1e7, 7)
+		rel_alt_m = float(getattr(msg, "relative_alt", 0.0) or 0.0) / 1000.0
+		update_filtered_altitude(snapshot, rel_alt_m)
+
+	elif msg_type == "GPS_RAW_INT":
+		fix_map = {0: "no_gps", 1: "no_fix", 2: "2d", 3: "3d", 4: "3d", 5: "3d"}
+		snapshot["gpsStatus"] = fix_map.get(int(msg.fix_type), "no_fix")
+		snapshot["satCount"] = int(getattr(msg, "satellites_visible", 0) or 0)
+
+	elif msg_type == "SYS_STATUS":
+		remaining = float(getattr(msg, "battery_remaining", 0) or 0)
+		voltage = float(getattr(msg, "voltage_battery", 0) or 0) / 1000.0
+		current = float(getattr(msg, "current_battery", 0) or 0) / 100.0
+		snapshot["batteries"] = [
+			{
+				"cellCount": 4,
+				"voltage": round(voltage, 2),
+				"current": round(current, 2),
+				"capacity": 0,
+				"remaining": round(max(0.0, remaining), 2),
+			}
+		]
+
+	elif msg_type == "HEARTBEAT":
+		base_mode = int(getattr(msg, "base_mode", 0) or 0)
+		vehicle_state.armed = bool(base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+
+
+def update_mode_from_connection(cm: ConnectionManager) -> None:
+	flight_mode = getattr(cm.mavlink, "flightmode", None)
+	if isinstance(flight_mode, str) and flight_mode:
+		vehicle_state.mode = flight_mode.upper()
+
+
+async def send_arm_command(arm: bool) -> None:
+	cm = ensure_connected_manager()
+	command_id = mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM
+
+	async with runtime_state.recv_lock:
+		cm.mavlink.mav.command_long_send(
+			cm.target_system,
+			cm.target_component,
+			command_id,
+			0,
+			1 if arm else 0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+		)
+
+		deadline = time.monotonic() + 3.0
+		ack = None
+		while time.monotonic() < deadline:
+			remaining = max(0.1, deadline - time.monotonic())
+			candidate = await asyncio.to_thread(
+				cm.mavlink.recv_match,
+				type="COMMAND_ACK",
+				blocking=True,
+				timeout=min(0.5, remaining),
+			)
+			if candidate is None:
+				continue
+			if int(getattr(candidate, "command", -1)) == int(command_id):
+				ack = candidate
+				break
+
+	if ack is None:
+		raise HTTPException(status_code=504, detail="No COMMAND_ACK for arm/disarm")
+
+	result = int(getattr(ack, "result", mavutil.mavlink.MAV_RESULT_FAILED))
+	if result not in (mavutil.mavlink.MAV_RESULT_ACCEPTED, mavutil.mavlink.MAV_RESULT_IN_PROGRESS):
+		raise HTTPException(status_code=400, detail=f"Arm/Disarm rejected (result={result})")
+
+	vehicle_state.armed = arm
+
+
+async def send_calibration_command(calibration_type: str) -> None:
+	cm = ensure_connected_manager()
+
+	param1 = 0.0  # gyro
+	param2 = 0.0  # magnetometer
+	param3 = 0.0
+	param4 = 0.0  # radio
+	param5 = 0.0  # accelerometer
+	param6 = 0.0
+	param7 = 0.0
+
+	if calibration_type == "gyroscope":
+		param1 = 1.0
+	elif calibration_type == "compass":
+		param2 = 1.0
+	elif calibration_type == "radio":
+		param4 = 1.0
+	elif calibration_type == "accelerometer":
+		param5 = 1.0
+	elif calibration_type == "esc":
+		raise HTTPException(
+			status_code=400,
+			detail="ESC calibration is vehicle-specific and not supported by this command",
+		)
+	else:
+		raise HTTPException(status_code=400, detail=f"Unsupported calibration type: {calibration_type}")
+
+	command_id = mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION
+
+	async with runtime_state.recv_lock:
+		cm.mavlink.mav.command_long_send(
+			cm.target_system,
+			cm.target_component,
+			command_id,
+			0,
+			param1,
+			param2,
+			param3,
+			param4,
+			param5,
+			param6,
+			param7,
+		)
+
+		deadline = time.monotonic() + 4.0
+		ack = None
+		while time.monotonic() < deadline:
+			remaining = max(0.1, deadline - time.monotonic())
+			candidate = await asyncio.to_thread(
+				cm.mavlink.recv_match,
+				type="COMMAND_ACK",
+				blocking=True,
+				timeout=min(0.5, remaining),
+			)
+			if candidate is None:
+				continue
+			if int(getattr(candidate, "command", -1)) == int(command_id):
+				ack = candidate
+				break
+
+	if ack is None:
+		raise HTTPException(status_code=504, detail="No COMMAND_ACK for calibration command")
+
+	result = int(getattr(ack, "result", mavutil.mavlink.MAV_RESULT_FAILED))
+	if result not in (mavutil.mavlink.MAV_RESULT_ACCEPTED, mavutil.mavlink.MAV_RESULT_IN_PROGRESS):
+		raise HTTPException(
+			status_code=400,
+			detail=f"Calibration command rejected (result={result})",
+		)
+
+
+async def send_motor_test_command(
+	motor_number: int,
+	throttle_percent: float,
+	duration_sec: float,
+) -> None:
+	cm = ensure_connected_manager()
+	telemetry_armed = bool((runtime_state.latest_telemetry or {}).get("armed", False))
+	if vehicle_state.armed or telemetry_armed:
+		raise HTTPException(status_code=409, detail="Motor test requires vehicle to be disarmed")
+
+	command_id = mavutil.mavlink.MAV_CMD_DO_MOTOR_TEST
+	throttle_type_percent = float(
+		getattr(
+			mavutil.mavlink,
+			"MOTOR_TEST_THROTTLE_PERCENT",
+			getattr(mavutil.mavlink, "MAV_MOTOR_TEST_THROTTLE_PERCENT", 0),
+		)
+	)
+	test_motor_count = 1.0
+	test_order_default = float(
+		getattr(
+			mavutil.mavlink,
+			"MOTOR_TEST_ORDER_DEFAULT",
+			getattr(mavutil.mavlink, "MOTOR_TEST_ORDER_BOARD", 0),
+		)
+	)
+
+	async with runtime_state.recv_lock:
+		cm.mavlink.mav.command_long_send(
+			cm.target_system,
+			cm.target_component,
+			command_id,
+			0,
+			float(motor_number),
+			throttle_type_percent,
+			float(throttle_percent),
+			float(duration_sec),
+			test_motor_count,
+			test_order_default,
+			0,
+		)
+
+		deadline = time.monotonic() + 3.0
+		ack = None
+		while time.monotonic() < deadline:
+			remaining = max(0.1, deadline - time.monotonic())
+			candidate = await asyncio.to_thread(
+				cm.mavlink.recv_match,
+				type="COMMAND_ACK",
+				blocking=True,
+				timeout=min(0.5, remaining),
+			)
+			if candidate is None:
+				continue
+			if int(getattr(candidate, "command", -1)) == int(command_id):
+				ack = candidate
+				break
+
+	if ack is None:
+		raise HTTPException(status_code=504, detail="No COMMAND_ACK for motor test")
+
+	result = int(getattr(ack, "result", mavutil.mavlink.MAV_RESULT_FAILED))
+	if result not in (mavutil.mavlink.MAV_RESULT_ACCEPTED, mavutil.mavlink.MAV_RESULT_IN_PROGRESS):
+		raise HTTPException(status_code=400, detail=f"Motor test rejected (result={result})")
+
+
+async def send_mission_start_command() -> None:
+	cm = ensure_connected_manager()
+	command_id = mavutil.mavlink.MAV_CMD_MISSION_START
+
+	async with runtime_state.recv_lock:
+		cm.mavlink.mav.command_long_send(
+			cm.target_system,
+			cm.target_component,
+			command_id,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+		)
+
+		deadline = time.monotonic() + 3.0
+		ack = None
+		while time.monotonic() < deadline:
+			remaining = max(0.1, deadline - time.monotonic())
+			candidate = await asyncio.to_thread(
+				cm.mavlink.recv_match,
+				type="COMMAND_ACK",
+				blocking=True,
+				timeout=min(0.5, remaining),
+			)
+			if candidate is None:
+				continue
+			if int(getattr(candidate, "command", -1)) == int(command_id):
+				ack = candidate
+				break
+
+	if ack is None:
+		raise HTTPException(status_code=504, detail="No COMMAND_ACK for mission start")
+
+	result = int(getattr(ack, "result", mavutil.mavlink.MAV_RESULT_FAILED))
+	if result not in (mavutil.mavlink.MAV_RESULT_ACCEPTED, mavutil.mavlink.MAV_RESULT_IN_PROGRESS):
+		raise HTTPException(status_code=400, detail=f"Mission start rejected (result={result})")
+
+
+@app.get("/api/health")
+async def health() -> dict:
+	return {"status": "ok"}
+
+
+@app.post("/api/connection/connect", response_model=ConnectionStatusResponse)
+async def connect_vehicle(payload: ConnectRequest) -> ConnectionStatusResponse:
+	if connection_state.connected:
+		return ConnectionStatusResponse(
+			connected=True,
+			connection_string=connection_state.connection_string,
+			connected_at=connection_state.connected_at,
+		)
+
+	connection_string, baudrate = parse_connection_string(payload.connection_string)
+	cm = ConnectionManager(connection_string, baudrate=baudrate)
+
+	try:
+		await cm.connect()
+	except Exception as error:
+		raise HTTPException(status_code=400, detail=f"Connection failed: {error}") from error
+
+	runtime_state.connection_manager = cm
+	connection_state.connected = True
+	connection_state.connection_string = payload.connection_string
+	connection_state.connected_at = time.time()
+	update_mode_from_connection(cm)
+	apply_telemetry_profile(cm, runtime_state.low_latency)
+
+	return ConnectionStatusResponse(
+		connected=connection_state.connected,
+		connection_string=connection_state.connection_string,
+		connected_at=connection_state.connected_at,
+	)
+
+
+@app.post("/api/connection/disconnect", response_model=ConnectionStatusResponse)
+async def disconnect_vehicle() -> ConnectionStatusResponse:
+	cm = runtime_state.connection_manager
+	if cm is not None:
+		await cm.disconnect()
+
+	runtime_state.connection_manager = None
+	connection_state.connected = False
+	connection_state.connection_string = None
+	connection_state.connected_at = None
+	vehicle_state.armed = False
+	vehicle_state.mode = "UNKNOWN"
+
+	return ConnectionStatusResponse(connected=False)
+
+
+@app.get("/api/connection/status", response_model=ConnectionStatusResponse)
+async def connection_status() -> ConnectionStatusResponse:
+	return ConnectionStatusResponse(
+		connected=connection_state.connected,
+		connection_string=connection_state.connection_string,
+		connected_at=connection_state.connected_at,
+	)
+
+
+@app.get("/api/connection/ports")
+async def connection_ports() -> dict:
+	devices: list[ConnectionDeviceResponse] = []
+
+	try:
+		serial_ports = await asyncio.wait_for(
+			asyncio.to_thread(list_ports.comports),
+			timeout=2.5,
+		)
+	except TimeoutError:
+		serial_ports = []
+
+	for port in serial_ports:
+		description = port.description if port.description else "Serial Device"
+		devices.append(
+			ConnectionDeviceResponse(
+				id=f"serial:{port.device}:{DEFAULT_SERIAL_BAUD}",
+				label=f"{port.device} ({description})",
+				kind="serial",
+			)
+		)
+
+	devices.append(
+		ConnectionDeviceResponse(
+			id="udp:127.0.0.1:14555",
+			label="UDP (127.0.0.1:14555)",
+			kind="network",
+		)
+	)
+	devices.append(
+		ConnectionDeviceResponse(
+			id="udp:127.0.0.1:14550",
+			label="UDP (127.0.0.1:14550)",
+			kind="network",
+		)
+	)
+	devices.append(
+		ConnectionDeviceResponse(
+			id="tcp:127.0.0.1:5760",
+			label="TCP (127.0.0.1:5760)",
+			kind="network",
+		)
+	)
+	devices.append(
+		ConnectionDeviceResponse(
+			id="tcp:192.168.1.100:5760",
+			label="TCP (192.168.1.100:5760)",
+			kind="network",
+		)
+	)
+
+	return {"devices": [device.model_dump() for device in devices]}
+
+
+@app.get("/api/telemetry/profile")
+async def telemetry_profile() -> dict:
+	return {"low_latency": runtime_state.low_latency}
+
+
+@app.post("/api/telemetry/profile")
+async def set_telemetry_profile(payload: TelemetryProfileRequest) -> dict:
+	runtime_state.low_latency = payload.low_latency
+
+	cm = runtime_state.connection_manager
+	if cm is not None and connection_state.connected:
+		apply_telemetry_profile(cm, runtime_state.low_latency)
+
+	return {"ok": True, "low_latency": runtime_state.low_latency}
+
+
+@app.get("/api/vehicle/info")
+async def vehicle_info() -> dict:
+	return {
+		"connected": connection_state.connected,
+		"armed": vehicle_state.armed,
+		"mode": vehicle_state.mode,
+	}
+
+
+@app.post("/api/vehicle/arm")
+async def arm_vehicle() -> dict:
+	await send_arm_command(True)
+	return {"ok": True, "armed": vehicle_state.armed}
+
+
+@app.post("/api/vehicle/disarm")
+async def disarm_vehicle() -> dict:
+	await send_arm_command(False)
+	return {"ok": True, "armed": vehicle_state.armed}
+
+
+@app.post("/api/vehicle/mode")
+async def set_vehicle_mode(payload: SetModeRequest) -> dict:
+	cm = ensure_connected_manager()
+	mode = payload.mode.upper()
+
+	mode_mapping = cm.mavlink.mode_mapping()
+	if not mode_mapping or mode not in mode_mapping:
+		raise HTTPException(status_code=400, detail=f"Unsupported mode: {mode}")
+
+	cm.mavlink.set_mode(mode_mapping[mode])
+	vehicle_state.mode = mode
+	return {"ok": True, "mode": vehicle_state.mode}
+
+
+@app.post("/api/vehicle/command")
+async def send_vehicle_command(payload: CommandRequest) -> dict:
+	ensure_connected_manager()
+	return {"ok": True, "command": payload.command, "params": payload.params}
+
+
+@app.post("/api/vehicle/motor-test")
+async def motor_test_vehicle(payload: MotorTestRequest) -> dict:
+	await send_motor_test_command(
+		motor_number=payload.motor_number,
+		throttle_percent=payload.throttle_percent,
+		duration_sec=payload.duration_sec,
+	)
+	return {
+		"ok": True,
+		"motor_number": payload.motor_number,
+		"throttle_percent": payload.throttle_percent,
+		"duration_sec": payload.duration_sec,
+	}
+
+
+@app.post("/api/vehicle/rtl")
+async def rtl_vehicle() -> dict:
+	return await set_vehicle_mode(SetModeRequest(mode="RTL"))
+
+
+@app.post("/api/vehicle/land")
+async def land_vehicle() -> dict:
+	return await set_vehicle_mode(SetModeRequest(mode="LAND"))
+
+
+@app.post("/api/vehicle/loiter")
+async def loiter_vehicle() -> dict:
+	return await set_vehicle_mode(SetModeRequest(mode="LOITER"))
+
+
+@app.get("/api/calibration/status")
+async def calibration_status() -> dict:
+	items = [item.model_dump() for item in runtime_state.calibration_items.values()]
+	return {"items": items}
+
+
+@app.post("/api/calibration/start")
+async def start_calibration(payload: CalibrationStartRequest) -> dict:
+	calibration_type = payload.type.lower()
+
+	if calibration_type not in runtime_state.calibration_items:
+		raise HTTPException(status_code=404, detail=f"Unknown calibration type: {calibration_type}")
+
+	item = runtime_state.calibration_items[calibration_type]
+
+	# ESC calibration is usually a manual/vehicle-specific workflow.
+	if calibration_type == "esc":
+		item.status = "unknown"
+		item.message = "ESC calibration is manual on this backend; use vehicle-specific procedure"
+		return {"ok": False, "item": item.model_dump()}
+
+	item.status = "in_progress"
+	item.message = "Calibration command sent"
+
+	try:
+		await send_calibration_command(calibration_type)
+		item.status = "calibrated"
+		item.last_calibrated = time.time()
+		item.message = "Calibration acknowledged"
+		return {"ok": True, "item": item.model_dump()}
+	except HTTPException as error:
+		item.status = "needs_calibration"
+		item.message = str(error.detail)
+		raise
+
+
+@app.get("/api/preflight/checks")
+async def preflight_checks() -> dict:
+	checks, ready_for_flight = build_preflight_checks()
+	return {
+		"checks": [item.model_dump() for item in checks],
+		"ready_for_flight": ready_for_flight,
+		"timestamp": int(time.time() * 1000),
+	}
+
+
+@app.post("/api/preflight/run")
+async def run_preflight_checks() -> dict:
+	checks, ready_for_flight = build_preflight_checks()
+	return {
+		"checks": [item.model_dump() for item in checks],
+		"ready_for_flight": ready_for_flight,
+		"timestamp": int(time.time() * 1000),
+	}
+
+
+@app.post("/api/mission/upload")
+async def mission_upload(payload: MissionUploadRequest | None = None) -> dict:
+	if payload is None:
+		items = _default_mission_items()
+		source = "default"
+	else:
+		if not payload.items:
+			raise HTTPException(status_code=422, detail="Mission items cannot be empty")
+		items = _validate_mission_items(payload.items)
+		source = "payload"
+		_persist_code_mission_template(items)
+
+	runtime_state.queued_mission_items = items
+
+	# Mission transfer protocol is not implemented in this main.py backend yet.
+	# We keep mission items queued so frontend can render and later sync.
+	return {
+		"mission_upload": None,
+		"mission_count": len(items),
+		"source": source,
+		"queued": True,
+		"synced_to_vehicle": False,
+	}
+
+
+@app.get("/api/mission/download")
+async def mission_download() -> dict:
+	items = runtime_state.queued_mission_items or []
+	return {
+		"mission_count": len(items),
+		"items": items,
+		"queued": True,
+		"source": "queued",
+	}
+
+
+@app.delete("/api/mission/clear")
+async def mission_clear() -> dict:
+	runtime_state.queued_mission_items = []
+	return {
+		"mission_clear": "queued_mission_cleared",
+		"queued": True,
+	}
+
+
+@app.post("/api/mission/start")
+async def mission_start() -> dict:
+	ensure_connected_manager()
+	queued_items = runtime_state.queued_mission_items or []
+
+	if not queued_items:
+		raise HTTPException(status_code=409, detail="No mission items queued")
+	if not vehicle_state.armed:
+		raise HTTPException(status_code=409, detail="Vehicle must be armed before mission start")
+	if vehicle_state.mode.upper() != "AUTO":
+		raise HTTPException(status_code=409, detail="Vehicle mode must be AUTO before mission start")
+
+	await send_mission_start_command()
+	return {
+		"ok": True,
+		"mission_start": "command_sent",
+		"queued": True,
+		"mission_count": len(queued_items),
+		"armed": vehicle_state.armed,
+		"mode": vehicle_state.mode,
+	}
+
+
+@app.websocket("/ws/telemetry")
+async def telemetry_ws(websocket: WebSocket) -> None:
+	await websocket.accept()
+	snapshot = default_telemetry_payload()
+
+	try:
+		while True:
+			if connection_state.connected and runtime_state.connection_manager is not None:
+				cm = runtime_state.connection_manager
+				async with runtime_state.recv_lock:
+					processed = 0
+					for _ in range(MAX_MESSAGES_PER_TICK):
+						msg = cm.mavlink.recv_match(blocking=False)
+						if msg is None:
+							break
+						apply_message_to_telemetry(snapshot, msg)
+						processed += 1
+
+					if processed == 0:
+						msg = await asyncio.to_thread(
+							cm.mavlink.recv_match,
+							blocking=True,
+							timeout=BLOCKING_POLL_TIMEOUT_S,
+						)
+						if msg is not None:
+							apply_message_to_telemetry(snapshot, msg)
+
+				update_mode_from_connection(cm)
+				snapshot["mode"] = vehicle_state.mode
+				snapshot["armed"] = vehicle_state.armed
+				snapshot["timestamp"] = int(time.time() * 1000)
+				runtime_state.latest_telemetry = dict(snapshot)
+
+				await websocket.send_json({"type": "telemetry", "data": snapshot})
+			else:
+				await websocket.send_json({"type": "connection", "data": {"connected": False}})
+
+			await asyncio.sleep(telemetry_push_interval())
+	except WebSocketDisconnect:
+		return
+

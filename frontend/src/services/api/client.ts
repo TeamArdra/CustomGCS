@@ -9,6 +9,11 @@ const apiClient: AxiosInstance = axios.create({
   },
 });
 
+export function isMissingEndpointError(error: unknown): boolean {
+  const status = (error as { response?: { status?: number } })?.response?.status;
+  return status === 404;
+}
+
 // Add token to requests if available
 apiClient.interceptors.request.use((config) => {
   const token = localStorage.getItem('authToken');
