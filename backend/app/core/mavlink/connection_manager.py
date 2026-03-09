@@ -1,3 +1,4 @@
+#connection_manager.py
 """
 MAVLink Connection Manager (M1.1)
 
@@ -64,18 +65,20 @@ class ConnectionManager:
             "source_system": self._source_system,
             "source_component": self._source_component,
         }
-        if self._baudrate is not None:
+        if self._baudrate is not None and (
+            self._connection_string.startswith("/dev")
+            or self._connection_string.startswith("COM")
+            or self._connection_string.startswith("serial")
+        ):
             connection_kwargs["baud"] = self._baudrate
 
         mav = mavutil.mavlink_connection(self._connection_string, **connection_kwargs)
 
         #Wait for first heartbeat (blocking, mocked in tests)
+        print(f"Connecting to MAVLink: {self._connection_string} baud={self._baudrate}")
+        print('Waiting for first MAVLink heartbeat...')
         first_heartbeat = mav.wait_heartbeat(timeout=self._connect_timeout_s)
         if first_heartbeat is None:
-            try:
-                mav.close()
-            except Exception:
-                pass
             raise TimeoutError(
                 f"No heartbeat received within {self._connect_timeout_s:.1f}s"
             )

@@ -1,3 +1,4 @@
+#message_dispatcher.py
 from collections import defaultdict
 from typing import Callable, Dict, List, Any
 
@@ -29,10 +30,14 @@ class MessageDispatcher:
 
         msg_type = message.get_type()
 
-        listeners = self._listeners.get(msg_type,[])
+        listeners = []
+
+        listeners.extend(self._listeners.get(msg_type,[]))
+
+        listeners.extend(self._listeners.get(None,[]))
 
         for listener in listeners:
             try:
                 listener(message)
-            except Exception:
-                continue
+            except Exception as e:
+                print("Dispatcher error:",e)

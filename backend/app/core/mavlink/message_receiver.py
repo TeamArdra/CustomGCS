@@ -1,3 +1,4 @@
+#message_receiver.py
 import asyncio
 import time
 from typing import Optional
@@ -11,8 +12,9 @@ class MessageReceiver:
     - Track last recieved HEARTBEAT timestamp
     - Run as a managed async background task
     """
-    def __init__(self,connection_manager):
+    def __init__(self,connection_manager,dispatcher):
         self._cm = connection_manager
+        self._dispatcher = dispatcher
 
         self._running: bool = False
         self._rx_task: Optional[asyncio.Task] = None
@@ -20,19 +22,20 @@ class MessageReceiver:
         self._last_rx_time: Optional[float] = None
 
     async def _rx_loop(self) -> None:
-        try:
-            while self._running:
+        while self._running:
+            while True:
                 msg = self._cm.mavlink.recv_match(blocking=False)
+                if msg is None:
+                    break
 
-                if msg is not None:
-                    if msg.get_type() == "HEARTBEAT":
-                        self._last_rx_time = time.monotonic()
+                #print("RX:",msg.get_type())
+
+                if msg.get_type()=="HEARTBEAT":
+                    self._last_rx_time = time.monotonic()
                 
-                await asyncio.sleep(0)
-        
-        except asyncio.CancelledError:
-            pass
-    
+                self._dispatcher.dispatch(msg)
+            
+            await asyncio.sleep(0)
     async def start(self) -> None:
         if not self._cm.is_connected:
             raise RuntimeError("Connection Manager is not connected")

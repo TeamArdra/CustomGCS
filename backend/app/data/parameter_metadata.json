@@ -1,0 +1,17 @@
+{
+  "ARMING_CHECK": {
+    "description": "Enable arming safety checks",
+    "type": "bitmask",
+    "default": 1
+  },
+  "SIM_SPEEDUP": {
+    "description": "Simulation speed multiplier",
+    "type": "float",
+    "default": 1
+  },
+  "GPS_TYPE": {
+    "description": "GPS driver type",
+    "type": "int",
+    "default": 1
+  }
+}

@@ -20,22 +20,25 @@ class CommandSender:
 
         self._dispatcher.subscribe("COMMAND_ACK",self._on_command_ack)
 
-    async def send_command(self,command_id:int) -> Any:
+    async def send_command(self,command_id:int,params=None):
         
         if not self._cm.is_connected:
             raise RuntimeError("Not connected to vehicle")
         
+        if params is None:
+            params=[0,0,0,0,0,0,0]
+
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
 
         self._pending[command_id] = future
 
         self._cm.mavlink.mav.command_long_send(
-            0,
-            0,
+            self._cm.target_system,
+            self._cm.target_component,
             command_id,
             0,
-            0, 0, 0, 0, 0, 0, 0
+            params[0], params[1], params[2], params[3], params[4], params[5], params[6],
         )
 
         try:
